@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# Función para esperar hasta que una transacción esté en la mempool
+wait_for_mempool() {
+    txid=$1
+    while true; do
+        result=$(sudo -u bitcoin bitcoin-cli getmempoolentry $txid 2>/dev/null)
+        if [ "$result" != "null" ]; then
+            break
+        fi
+        sleep 1
+    done
+}
+
+# Crear billeteras
+sudo -u bitcoin bitcoin-cli createwallet "Miner"
+sudo -u bitcoin bitcoin-cli createwallet "Trader"
+
+# Fondear la billetera Miner
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" generatetoaddress 150 "$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" getnewaddress)"
+
+# Crear transacción parent
+txid_miner=$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" sendtoaddress "$(sudo -u bitcoin bitcoin-cli -rpcwallet="Trader" getnewaddress)" 70)
+txid_trader=$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" sendtoaddress "$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" getnewaddress)" 29.99999)
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" walletcreatefundedpsbt '[]' '[{"'$txid_miner'":0}]' '{"includeWatching":false,"replaceable":true,"changeAddress":"'$txid_trader'"}'
+
+# Activar RBF en la transacción parent
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" walletprocesspsbt "$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" walletcreatefundedpsbt '[]' '[{"'$txid_miner'":0}]' '{"includeWatching":false,"replaceable":true,"changeAddress":"'$txid_trader'"}' | jq -r .psbt)"
+
+# Firmar y transmitir la transacción parent
+signed_tx=$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" walletprocesspsbt "$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" walletcreatefundedpsbt '[]' '[{"'$txid_miner'":0}]' '{"includeWatching":false,"replaceable":true,"changeAddress":"'$txid_trader'"}' | jq -r .psbt)" | jq -r .hex)
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" signrawtransactionwithwallet $signed_tx | jq -r .hex | sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" sendrawtransaction -
+
+# Esperar hasta que la transacción parent esté en la mempool
+wait_for_mempool $txid_miner
+
+# Obtener detalles de la transacción parent desde la mempool
+details=$(sudo -u bitcoin bitcoin-cli getmempoolentry $txid_miner | jq -r '.|{input: [.depends|.[]|{txid:.txid,vout:.vout}],output:[.entry.data.vout[0].scriptPubKey,.entry.data.vout[1].scriptPubKey],Fees:.entry.fee,Weight:.entry.weight}')
+echo $details
+
+# Crear transacción child
+txid_child=$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" sendtoaddress "$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" getnewaddress)" 29.99998 $txid_miner 0)
+
+# Consultar getmempoolentry para la transacción child
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" getmempoolentry $txid_child
+
+# Aumentar la tarifa de la transacción parent mediante RBF
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" bumpfee $txid_miner '{"confTarget":1}'
+
+# Firmar y transmitir la nueva transacción parent
+new_signed_tx=$(sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" bumpfee $txid_miner '{"confTarget":1,"replaceable":true}' | jq -r .hex)
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" signrawtransactionwithwallet $new_signed_tx | jq -r .hex | sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" sendrawtransaction -
+
+# Esperar hasta que la transacción child esté en la mempool
+wait_for_mempool $txid_child
+
+# Consultar getmempoolentry para la transacción child nuevamente
+sudo -u bitcoin bitcoin-cli -rpcwallet="Miner" getmempool
